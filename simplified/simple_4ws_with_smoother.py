@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
-
+# four_ws_node.py – v13
+#
+#  • ACK  : gerçek Ackermann
+#  • CRAB : sabit ±90 ° – stick X yalnızca hız
+#  • PIVOT: sabit ±45 ° / ±135 ° – stick X yalnızca dönme hızı
+#  • STOP : her şey sıfır
+#
+#  – Hız ancak teker açıları ±4 ° toleransta iken verilir
+#  – Açılar ±90 ° bandına katlanır; işaret uyumsuzsa teker hızının
+#    yönü otomatik ters çevrilir
+#  – Tek satır log:  [MOD] pos={ … } vel={ … }
 
 import math, json, socket, numpy as np, rclpy
 from rclpy.node      import Node
@@ -53,9 +63,10 @@ class FourWS(Node):
     def __init__(self):
         super().__init__("four_ws")
 
-        self.declare_parameter("max_rate_deg", 40.0)   # artık kullanılmıyor
+        self.declare_parameter("max_rate_deg", 40.0)
         self.declare_parameter("speed_dead",   0.02)
         self.dt         = 0.02
+        self.max_rate   = math.radians(self.get_parameter("max_rate_deg").value)
         self.speed_dead = self.get_parameter("speed_dead").value
 
         # geometri
@@ -159,9 +170,10 @@ class FourWS(Node):
         else:
             targ, vel = targ_raw, vel_raw   # hepsi 0
 
-        # ─────── SLEW-RATE KALDIRILDI ───────
-        smooth = targ                       # artık doğrudan hedef
-        self.prev_pos = smooth              # hizalama kontrolü için güncelle
+        # Slew-rate
+        max_d  = self.max_rate * self.dt
+        smooth = np.clip(targ - self.prev_pos, -max_d, +max_d) + self.prev_pos
+        self.prev_pos = smooth
 
         self._send_all(smooth, vel)
         self._log(smooth, vel)
