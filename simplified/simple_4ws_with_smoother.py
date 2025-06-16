@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# four_ws_node.py – v13
+# four_ws_node.py – v13-fix-pivot
 #
 #  • ACK  : gerçek Ackermann
 #  • CRAB : sabit ±90 ° – stick X yalnızca hız
@@ -70,7 +70,7 @@ class FourWS(Node):
         self.speed_dead = self.get_parameter("speed_dead").value
 
         # geometri
-        self.L, self.W  = 1.48996, 1.2405     # m
+        self.L, self.W  = 1.48996, 1.245     # m
         self.pos_per_deg= 27.7*105.26         # servo cnt / °
         self.xy = np.array([[ self.L/2,  self.W/2], [ self.L/2,-self.W/2],
                             [-self.L/2,  self.W/2], [-self.L/2,-self.W/2]])
@@ -79,7 +79,10 @@ class FourWS(Node):
         self.prev_pos     = np.zeros(4)
         self.prev_mode    = mode
         self.crab_angles  = np.zeros(4)
-        self.pivot_angles = np.array([ math.atan2(x,-y) for x,y in self.xy ])  # ±45 / ±135
+
+        # --- PIVOT açıları ---
+        self.pivot_angles = np.array([ math.atan2(x, -y) for x, y in self.xy ])
+        self.pivot_angles[0:2] *= -1      # << düzeltme: ön iki tekerin açısını tersine çevir
 
         self.create_timer(self.dt, self.loop)
 
@@ -137,17 +140,34 @@ class FourWS(Node):
         targ_raw = np.zeros(4); vel_raw = np.zeros(4)
 
         # ─── ACK ───
+        # ─── ACK ───
         if mode == MODE_ACK:
-            steer_c = axis_rsx * math.radians(35)
-            if abs(steer_c) > 1e-3:
-                R = self.L / math.tan(abs(steer_c))
-                d_in  = math.atan(self.L / (R - self.W/2))
-                d_out = math.atan(self.L / (R + self.W/2))
-                if steer_c > 0: targ_raw[0], targ_raw[1] =  d_in,  d_out
-                else:           targ_raw[0], targ_raw[1] = -d_out, -d_in
-            vx = axis_fwd * 2.0
-            vel_raw[:] = vx
+            steer_c = axis_rsx * math.radians(35)        # orta noktadaki direksiyon açısı
+            v_c     = axis_fwd * 2.0                     # aracın ileri hızı (merkez)
+            targ_raw[:] = 0.0
+            vel_raw[:]  = 0.0
+
+            # Direksiyon sıfıra çok yakınsa klasik düz-sürüş
+            if abs(steer_c) < 1e-3:
+                vel_raw[:] = v_c
+
+            else:
+                R = self.L / math.tan(steer_c)           # ICC yarıçapı (işareti korur)
+                ω = v_c / R                              # açısal hız  rad s-¹
+
+                for i, (x, y) in enumerate(self.xy):
+                    # Teker ekseni, ICC’ye çizilen yarıçapın normaline paralel olmalı
+                    targ_raw[i] = math.atan2(x, R - y)
+
+                    # O tekerin yol yarıçapı
+                    r_i = math.hypot(x, R - y)
+
+                    # Hız = ω · r_i   (işaret v_c ile aynı kalır)
+                    vel_raw[i] = ω * r_i
+
+            # ±90 ° bandına katla → yön tersse hız işareti de tersine döner
             targ, vel = self._wrap90(targ_raw, vel_raw)
+
 
         # ─── CRAB ───
         elif mode == MODE_CRAB:

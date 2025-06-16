@@ -4,7 +4,7 @@ import time
 import struct
 
 # Dönüş yönleri ters olan motor indekslerini buraya ekleyebilirsiniz
-reverse_motors =  [0, 4]
+reverse_motors =  [0,1, 4,7]
 
 class MotorManager:
     def __init__(self, interface_name):

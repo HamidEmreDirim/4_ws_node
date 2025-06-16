@@ -1,134 +1,147 @@
-import sys
-import argparse
+#!/usr/bin/env python3
+"""
+PyQt5 GUI to tune SV‑DA200 series servo drives via EtherCAT.
+
+─ Widgets ──────────────────────────────────────────────────────────────
+• Slider 1  (0‑1000 ms)  →  P0.332  Smooth LPF of position command (slave‑0)
+• Slider 2  (0‑1000 ms)  →  P0.342  FIR filter of position command   (slave‑0)
+• Slider 3  (‑180 … +180 °) → Target position for slaves 0,2,4,6
+• Button    "Write All"   → Sends all three values in one go
+
+Edit the constants at the top (INTERFACE, COUNTS_PER_REV, CANopen indexes)
+according to your hardware/manual before running.
+Run with sudo if pysoem requires root NIC access:
+    sudo python3 motor_gui.py
+"""
+
+import sys, struct, ctypes, math, signal
 from PyQt5 import QtWidgets, QtCore
-
 from motor_manager import MotorManager
-# ------------------------------------------------------------
-# Which slaves are the steering/position motors?
-# ------------------------------------------------------------
-POSITION_MOTOR_SLAVES = [0, 2, 4, 6]
 
+# ─────────────────────────── User‑configurable constants ──────────────
+INTERFACE = "enp3s0"           # ↯ Change to the NIC that talks EtherCAT
+POSITION_SLAVES = [0, 2, 4, 6]  # Slaves that work in Position mode
 
-class ControlWindow(QtWidgets.QWidget):
-    """4‑Wheel‑Steer control panel with PyQt5 sliders."""
+# CANopen indexes for SV‑DA200 (verify in the manual!)
+P0_332_IDX = 0x2021  # Smooth LPF of position command
+P0_342_IDX = 0x2022  # FIR filter of position command
 
-    def __init__(self, iface: str = "eth0") -> None:
+COUNTS_PER_REV = 100000         # Encoder counts per mechanical revolution
+COUNTS_PER_DEG = (COUNTS_PER_REV / 360.0) * 105.26
+
+# ───────────────────────────── Main Window ────────────────────────────
+class MotorGui(QtWidgets.QWidget):
+    def __init__(self):
         super().__init__()
-        self.setWindowTitle("4WS Motor Control Panel")
-        self.iface = iface
-        self.mm: MotorManager | None = None
-        self.pos_per_deg: float = 1.0  # fallback – overwritten after EC init
+        self.setWindowTitle("SV‑DA200 Filter & Position Tuner")
+        self.resize(420, 240)
 
-        self._init_ethercat()   # Must come first – we query constants from lib
+        # Initialise EtherCAT once; reuse throughout session
+        try:
+            self.mm = MotorManager(INTERFACE)
+            self.mm.initialize()
+            for idx in POSITION_SLAVES:
+                self.mm.configure_position_mode(idx)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "EtherCAT init failed", str(e))
+            raise
+
+        # Build UI
         self._build_ui()
 
-    # -----------------------------------------------------------------
-    # GUI construction
-    # -----------------------------------------------------------------
+    # ------------------------------------------------------------------
     def _build_ui(self):
-        layout = QtWidgets.QVBoxLayout(self)
+        self.sldr_lpf  = self._make_slider(0, 1000)         # P0.332
+        self.sldr_fir  = self._make_slider(0, 1000)         # P0.342
+        self.sldr_pos  = self._make_slider(-180, 180)       # target position
 
-        # ── Slider for P0.332 – Smooth filter (ms) ────────────────────
-        self.sld_0332 = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
-        self.sld_0332.setRange(0, 1000)
-        self.sld_0332.setValue(0)
-        self.lbl_0332 = QtWidgets.QLabel("P0.332 Smooth filter: 0 ms")
-        self.sld_0332.valueChanged.connect(
-            lambda v: self.lbl_0332.setText(f"P0.332 Smooth filter: {v} ms"))
+        self.lbl_lpf   = QtWidgets.QLabel()
+        self.lbl_fir   = QtWidgets.QLabel()
+        self.lbl_pos   = QtWidgets.QLabel()
 
-        # ── Slider for P0.342 – FIR filter ────────────────────────────
-        self.sld_0342 = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
-        self.sld_0342.setRange(0, 1000)
-        self.sld_0342.setValue(0)
-        self.lbl_0342 = QtWidgets.QLabel("P0.342 FIR filter: 0")
-        self.sld_0342.valueChanged.connect(
-            lambda v: self.lbl_0342.setText(f"P0.342 FIR filter: {v}"))
+        self._update_label(self.lbl_lpf, "P0.332 LPF", self.sldr_lpf.value(), "ms")
+        self._update_label(self.lbl_fir, "P0.342 FIR", self.sldr_fir.value(), "ms")
+        self._update_label(self.lbl_pos, "Target pos", self.sldr_pos.value(), "°")
 
-        # ── Slider for absolute wheel angle (°) ───────────────────────
-        self.sld_pos = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
-        self.sld_pos.setRange(-180, 180)
-        self.sld_pos.setValue(0)
-        self.lbl_pos = QtWidgets.QLabel("Target position: 0 °")
-        self.sld_pos.valueChanged.connect(
-            lambda v: self.lbl_pos.setText(f"Target position: {v} °"))
+        self.btn_write = QtWidgets.QPushButton("Write All")
+        self.btn_write.clicked.connect(self.write_all)
 
-        # ── Write‑all push‑button ─────────────────────────────────────
-        self.btn_write = QtWidgets.QPushButton("WRITE ALL")
-        self.btn_write.setStyleSheet("font-weight:bold; padding:8px 16px;")
-        self.btn_write.clicked.connect(self._on_write_all)
+        grid = QtWidgets.QGridLayout(self)
+        grid.addWidget(self.lbl_lpf,  0, 0); grid.addWidget(self.sldr_lpf,  0, 1)
+        grid.addWidget(self.lbl_fir,  1, 0); grid.addWidget(self.sldr_fir,  1, 1)
+        grid.addWidget(self.lbl_pos,  2, 0); grid.addWidget(self.sldr_pos,  2, 1)
+        grid.addWidget(self.btn_write,3, 0, 1, 2)
 
-        # Add widgets to the form
-        for w in (self.lbl_0332, self.sld_0332,
-                  self.lbl_0342, self.sld_0342,
-                  self.lbl_pos,  self.sld_pos,
-                  self.btn_write):
-            layout.addWidget(w)
+        # Live label updates
+        self.sldr_lpf.valueChanged.connect(lambda v: self._update_label(self.lbl_lpf, "P0.332 LPF", v, "ms"))
+        self.sldr_fir.valueChanged.connect(lambda v: self._update_label(self.lbl_fir, "P0.342 FIR", v, "ms"))
+        self.sldr_pos.valueChanged.connect(lambda v: self._update_label(self.lbl_pos, "Target pos", v, "°"))
 
-    # -----------------------------------------------------------------
-    # EtherCAT initialisation
-    # -----------------------------------------------------------------
-    def _init_ethercat(self):
+    # ------------------------------------------------------------------
+    def _make_slider(self, lo:int, hi:int) -> QtWidgets.QSlider:
+        s = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        s.setRange(lo, hi)
+        s.setTickInterval(max(1, (hi - lo) // 20))
+        s.setTickPosition(QtWidgets.QSlider.TicksBelow)
+        s.setSingleStep(1)
+        s.setPageStep(10)
+        return s
+
+    @staticmethod
+    def _update_label(lbl:QtWidgets.QLabel, name:str, val:int, unit:str):
+        lbl.setText(f"{name}: {val} {unit}")
+
+    # ------------------------------------------------------------------
+    def _write_u16(self, slave_idx:int, index:int, value:int):
+        """Write unsigned 16‑bit SDO."""
         try:
-            self.mm = MotorManager(self.iface)
-            self.mm.initialize()
-            # Read constant provided by the library (27.7*105.26 by default)
-            if hasattr(self.mm, "pos_per_deg"):
-                self.pos_per_deg = float(self.mm.pos_per_deg)
+            payload = struct.pack("<H", value & 0xFFFF)
+            self.mm.slaves[slave_idx].sdo_write(index, 0, payload)
+            print(f"SDO 0x{index:04X}.0 <- {value} (slave {slave_idx})")
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "SDO Error",
+                                           f"Failed to write 0x{index:04X} on slave {slave_idx}: {e}")
 
-            # All position motors → Position mode once
-            for idx in POSITION_MOTOR_SLAVES:
-                self.mm.configure_position_mode(idx)
-        except Exception as exc:
-            QtWidgets.QMessageBox.critical(self, "EtherCAT error",
-                                           f"Failed to init EtherCAT: {exc}")
-            sys.exit(1)
+    @staticmethod
+    def _deg_to_counts(deg:float) -> int:
+        return int(deg * COUNTS_PER_DEG)
 
-    # -----------------------------------------------------------------
-    # Button callback – commit all three slider values
-    # -----------------------------------------------------------------
-    def _on_write_all(self):
-        if not self.mm:
-            return
+    # ------------------------------------------------------------------
+    def write_all(self):
+        lpf_val = self.sldr_lpf.value()
+        fir_val = self.sldr_fir.value()
+        pos_deg = self.sldr_pos.value()
+        tgt_cnt = self._deg_to_counts(pos_deg)
 
-        p0332_val = self.sld_0332.value()
-        p0342_val = self.sld_0342.value()
-        pos_deg   = self.sld_pos.value()
+        # 1️⃣ Filters on slave‑0
+        self._write_u16(0, P0_332_IDX, lpf_val)
+        self._write_u16(0, P0_342_IDX, fir_val)
 
-        # --- filter parameters go to slave‑0 via MotorManager helpers ---
-        self.mm.set_position_smooth_filter(p0332_val, slave_index=0)
-        self.mm.set_position_fir_filter(p0342_val,    slave_index=0)
+        # 2️⃣ Position on all designated slaves
+        for idx in POSITION_SLAVES:
+            self.mm.set_position(idx, tgt_cnt)
 
-        # --- broadcast absolute position to all steering wheels --------
-        counts = int(pos_deg * self.pos_per_deg)
-        for idx in POSITION_MOTOR_SLAVES:
-            self.mm.set_position(idx, counts)
+        QtWidgets.QMessageBox.information(self, "Done",
+            f"LPF={lpf_val} ms, FIR={fir_val} ms, Target={pos_deg}° ({tgt_cnt} cnt)")
 
-    # -----------------------------------------------------------------
-    # Graceful shutdown – stop drives & close master
-    # -----------------------------------------------------------------
+    # ------------------------------------------------------------------
     def closeEvent(self, event):
-        if self.mm:
+        """Graceful shutdown when window closed."""
+        try:
             self.mm.stop_all()
             self.mm.close()
-        super().closeEvent(event)
+        except Exception:
+            pass
+        event.accept()
 
-# ---------------------------------------------------------------------
-# main()
-# ---------------------------------------------------------------------
-
+# ──────────────────────────────────────────────────────────────────────
 def main():
+    # Allow Ctrl‑C in terminal to kill GUI
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+
     app = QtWidgets.QApplication(sys.argv)
-
-    parser = argparse.ArgumentParser(description="4WS motor GUI (PyQt5)")
-    parser.add_argument("--iface", default="eth0",
-                        help="EtherCAT interface (default eth0)")
-    args = parser.parse_args()
-
-    win = ControlWindow(args.iface)
-    win.resize(500, 300)
-    win.show()
-
+    gui = MotorGui(); gui.show()
     sys.exit(app.exec_())
 
-if __name__ == "__main__":  # pragma: no cover
+if __name__ == "__main__":
     main()

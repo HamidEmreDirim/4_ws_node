@@ -9,7 +9,7 @@ reverse_motors =  [0, 4]
 
 class MotorManager:
     def __init__(self, interface_name):
-        self.interface_name = interface_name
+        self.interface_name = "enp3s0"
         self.master = pysoem.Master()
         self.slaves = []
         self.pos_per_deg = 27.7 * 105.26  # ≈ 2911.8
